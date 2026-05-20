@@ -1,0 +1,24 @@
+[package]
+name = "huub-c-api"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "C ABI wrapper around the Huub CP solver, for ScheduleInf productization."
+
+# Standalone crate — opt out of any ambient workspace discovery
+# (same pattern as ../huub_eval/).
+[workspace]
+
+[lib]
+name = "huub_c_api"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+huub = { path = "../../third_party/huub/crates/huub" }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
