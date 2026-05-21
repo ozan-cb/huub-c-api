@@ -1,13 +1,9 @@
-//! C ABI wrapper around Huub, sized for the `ScheduleInf` productization
-//! plan (see `../../PRODUCTIZATION.md`).
+//! C ABI wrapper around the [Huub](https://github.com/huub-solver/huub) CP
+//! solver.
 //!
-//! v0 scope (this file): the minimum surface that exercises the full
-//! pipeline end-to-end — opaque model handle, int/bool var creation, one
-//! linear-constraint primitive, single-worker solve, value extraction,
-//! thread-local last-error. v1+ will fill in the rest of the constraint
-//! classes from `PRODUCTIZATION.md` §2 (no_overlap/disjunctive, element,
-//! cumulative, all_different, max/min/mul/div/mod, reification,
-//! branchers, portfolio).
+//! v0 scope: opaque model handle, int/bool var creation, one linear-constraint
+//! primitive, single-worker satisfy solve, value extraction, thread-local
+//! last-error.
 //!
 //! Conventions:
 //!
@@ -17,9 +13,8 @@
 //!   a sentinel handle).
 //! * Handles are opaque (`*mut HuubModel`). All allocation owned by Rust;
 //!   the C side must call `huub_model_free`. Handles are **not thread-
-//!   safe** — Huub's `Solver` is `!Send`, so each handle stays on the
-//!   thread it was created on. (See `tools/huub_eval/src/portfolio.rs`
-//!   for the build-in-thread-closure workaround used by the harness.)
+//!   safe** — Huub's `Solver` is `!Send`, so each handle must stay on the
+//!   thread it was created on.
 //! * Variable IDs are `int32_t` indices into per-handle Vec registries.
 //!   This keeps the ABI stable (no leaking of Rust internal handle
 //!   types) and gives the C++ side a friendly integer identifier.
@@ -367,8 +362,7 @@ fn solve_inner(
     bool_views: &[View<bool>],
     time_limit_seconds: f64,
 ) -> (HuubResult, Vec<Option<IntVal>>, Vec<Option<bool>>) {
-    // Lower. Mirrors `tools/huub_eval/src/translate.rs::solve_with_cfg`:
-    // a conflict during lowering means UNSAT, not an FFI error.
+    // Lower. A conflict during lowering means UNSAT, not an FFI error.
     let lower_result = model.lower().to_solver();
     let (mut solver, map): (Solver, _) = match lower_result {
         Ok(pair) => pair,
@@ -382,7 +376,7 @@ fn solve_inner(
         }
     };
 
-    // Wall-clock terminate callback. Same pattern as huub_eval.
+    // Wall-clock terminate callback.
     if time_limit_seconds > 0.0 {
         let deadline = Instant::now() + Duration::from_secs_f64(time_limit_seconds);
         solver.set_terminate_callback(Some(move || {
