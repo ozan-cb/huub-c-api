@@ -4,11 +4,28 @@ A C ABI wrapper around the [Huub](https://github.com/huub-solver/huub) CP solver
 
 ## Features
 
+**Model construction**
 - Opaque model handle (`HuubModel*`) with full lifecycle management
-- Integer decision variables with arbitrary `[lb, ub]` domains
+- Integer decision variables with arbitrary `[lb, ub]` domains, plus fixed-value constants
 - Boolean decision variables
-- Linear constraints (`<=`, `<`, `>=`, `>`, `==`, `!=`)
-- Single-worker satisfaction solve with optional wall-clock time limit
+- Synthetic interval handles `(start, size, end)` with automatic `start + size == end` consistency
+
+**Constraints**
+- Linear (`<=`, `<`, `>=`, `>`, `==`, `!=`), with optional half-reification (`enforce → constraint`) or full reification (iff)
+- Aggregates: `max`, `min`, `mul`, `div`, `mod` (mod is synthesized via div + mul + linear)
+- Channeling: `element` (constant array and variable array), `all_different`, `inverse` (synthesized via 2N element + 2 unique)
+- Boolean: `bool_or`, `bool_and` (with optional half-reification), `implication`, `at_most_one` (synthesized via linear over bool→int)
+- Scheduling: `no_overlap` (1-D), `disjunctive` (1-D, requires constant durations, enables edge-finding + not-last + detectable-precedence propagators)
+
+**Search and solve**
+- Single-worker `satisfy` / `minimize` / `maximize`, with the lowered solver kept alive across re-solves
+- `reset_for_resolve` for the warm-start–driven re-solve pattern (T_squeeze binary search style): clear the previous assignment, restage hints, solve again, without re-lowering the model
+- Decision strategies: `IntBrancher` and `BoolBrancher` with `AntiFirstFail` / `FirstFail` / `InputOrder` / `Largest` / `Smallest` variable selection and `IndomainMin` / `IndomainMax` / `OutdomainMin` / `OutdomainMax` value selection
+- Top-level search strategy: `Branchers` / `Sat` / `Transition(conflicts)` / `Interleaved(conflicts)`
+- Warm-start hints (int + bool) accumulated incrementally and materialized as `WarmStartBrancher` on each solve
+- Wall-clock time limit and conflict budget, OR-combined into a single terminate callback
+
+**Safety**
 - Thread-local last-error string (no global state)
 - Panic safety: Rust panics are caught at every FFI boundary and reported as error codes
 

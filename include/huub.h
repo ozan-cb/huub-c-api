@@ -60,6 +60,53 @@ typedef enum {
 } HuubRelOp;
 
 /**
+ * Variable-selection strategy for `huub_model_add_decision_strategy_*`.
+ * Mirrors `huub::solver::branchers::DecisionSelection`.
+ */
+typedef enum {
+  HUUB_DECISION_SEL_ANTI_FIRST_FAIL = 0,
+  HUUB_DECISION_SEL_FIRST_FAIL = 1,
+  HUUB_DECISION_SEL_INPUT_ORDER = 2,
+  HUUB_DECISION_SEL_LARGEST = 3,
+  HUUB_DECISION_SEL_SMALLEST = 4,
+} HuubDecisionSel;
+
+/**
+ * Value-selection strategy for `huub_model_add_decision_strategy_*`.
+ * Mirrors `huub::solver::branchers::DomainSelection`.
+ */
+typedef enum {
+  HUUB_DOMAIN_SEL_INDOMAIN_MIN = 0,
+  HUUB_DOMAIN_SEL_INDOMAIN_MAX = 1,
+  HUUB_DOMAIN_SEL_OUTDOMAIN_MIN = 2,
+  HUUB_DOMAIN_SEL_OUTDOMAIN_MAX = 3,
+} HuubDomainSel;
+
+/**
+ * Top-level search strategy for `huub_model_set_search_strategy`. Mirrors
+ * `huub::solver::SearchStrategy`. `switch_after_conflicts` is consumed
+ * only for `Transition` / `Interleaved`; ignored for `Branchers` / `Sat`.
+ */
+typedef enum {
+  /**
+   * Use the user-provided branchers exclusively (no SAT-engine search).
+   */
+  HUUB_SEARCH_STRATEGY_BRANCHERS = 0,
+  /**
+   * Use the SAT engine's default search, ignoring branchers.
+   */
+  HUUB_SEARCH_STRATEGY_SAT = 1,
+  /**
+   * Start with branchers, switch to Sat after the trigger fires.
+   */
+  HUUB_SEARCH_STRATEGY_TRANSITION = 2,
+  /**
+   * Interleave branchers and Sat search, switching on every trigger.
+   */
+  HUUB_SEARCH_STRATEGY_INTERLEAVED = 3,
+} HuubSearchStrategy;
+
+/**
  * Opaque handle. C side only sees `HuubModel*`.
  */
 typedef struct HuubModel HuubModel;
@@ -101,6 +148,18 @@ int32_t huub_model_new_int_var(HuubModel *handle, int64_t lb, int64_t ub);
 int32_t huub_model_new_bool_var(HuubModel *handle);
 
 /**
+ * Create a new integer constant variable with fixed value `val`. The
+ * returned variable id is interchangeable with a regular int var; reads
+ * of its value after `solve` will yield `val`.
+ *
+ * Used by callers that need to mix constants into linear expressions or
+ * pass a constant duration into `huub_model_new_interval`. Internally
+ * posts a singleton-domain decision `val..=val`; the solver folds it to
+ * a constant `View<IntVal>` during lowering.
+ */
+int32_t huub_model_new_constant(HuubModel *handle, int64_t val);
+
+/**
  * Post a linear constraint: `sum(coeffs[i] * int_var[var_ids[i]]) op rhs`.
  *
  * `var_ids` and `coeffs` are arrays of length `n`. All ids must refer to
@@ -119,17 +178,298 @@ HuubResult huub_model_add_linear(HuubModel *handle,
                                  int64_t rhs);
 
 /**
- * Lower the model and run a single-worker satisfaction search.
+ * Post `target = max(vars[0], ..., vars[n-1])`. All ids must be valid
+ * int-var ids. `n` must be > 0.
+ */
+HuubResult huub_model_add_max(HuubModel *handle,
+                              int32_t target,
+                              const int32_t *var_ids,
+                              uintptr_t n);
+
+/**
+ * Post `target = min(vars[0], ..., vars[n-1])`.
+ */
+HuubResult huub_model_add_min(HuubModel *handle,
+                              int32_t target,
+                              const int32_t *var_ids,
+                              uintptr_t n);
+
+/**
+ * Post `target = a * b`.
+ */
+HuubResult huub_model_add_mul(HuubModel *handle, int32_t target, int32_t a, int32_t b);
+
+/**
+ * Post `target = numerator / denominator` (integer division). Huub's
+ * `IntDivBounds` defines the rounding convention; callers should
+ * constrain the denominator's domain to avoid zero if division-by-zero
+ * is not desired.
+ */
+HuubResult huub_model_add_div(HuubModel *handle,
+                              int32_t target,
+                              int32_t numerator,
+                              int32_t denominator);
+
+/**
+ * Post `target = values[index]`, where `values` is a constant array
+ * (length `n`) of i64 and `index` is an int-var id whose domain must
+ * cover at least `[0, n-1]` to make the constraint satisfiable.
+ */
+HuubResult huub_model_add_element_const(HuubModel *handle,
+                                        int32_t index,
+                                        const int64_t *values,
+                                        uintptr_t n,
+                                        int32_t target);
+
+/**
+ * Post `target = array[index]`, where `array` is an array (length `n`)
+ * of int-var ids and `index` is an int-var id.
+ */
+HuubResult huub_model_add_element_var(HuubModel *handle,
+                                      int32_t index,
+                                      const int32_t *var_ids,
+                                      uintptr_t n,
+                                      int32_t target);
+
+/**
+ * Post `all_different(vars)`: each pair of variables in the list must
+ * take distinct values.
+ */
+HuubResult huub_model_add_all_different(HuubModel *handle, const int32_t *var_ids, uintptr_t n);
+
+/**
+ * Post a half- or fully-reified linear constraint:
+ * `sum(coeffs[i] * int_var[var_ids[i]]) op rhs`, gated by `enforce_lit`.
  *
- * `time_limit_seconds <= 0` disables the wall-clock limit. Returns one of
- * `Satisfied`, `Unsatisfiable`, `Unknown`, or `Error`. After a successful
- * solve, call `huub_model_value_int` / `huub_model_value_bool` to read
- * the assignment.
+ * * `half = true`  → install `enforce_lit → constraint` (CP-SAT's
+ *   `.OnlyEnforceIf` semantics — one-way implication).
+ * * `half = false` → install `enforce_lit ↔ constraint` (full iff).
  *
- * Once called, the model transitions to a "solved" state and further
- * mutations (var creation, constraint posting) will fail.
+ * If `enforce_lit < 0` the call is equivalent to a plain
+ * `huub_model_add_linear`.
+ */
+HuubResult huub_model_add_linear_reif(HuubModel *handle,
+                                      const int32_t *var_ids,
+                                      const int64_t *coeffs,
+                                      uintptr_t n,
+                                      HuubRelOp op,
+                                      int64_t rhs,
+                                      int32_t enforce_lit,
+                                      bool half);
+
+/**
+ * Post a Boolean disjunction `lits[0] ∨ lits[1] ∨ ... ∨ lits[n-1]`,
+ * optionally half-reified by `enforce_lit` (semantics match
+ * `huub_model_add_linear_reif`: `enforce → disjunction`).
+ */
+HuubResult huub_model_add_bool_or(HuubModel *handle,
+                                  const int32_t *lits,
+                                  uintptr_t n,
+                                  int32_t enforce_lit);
+
+/**
+ * Post a Boolean conjunction `lits[0] ∧ lits[1] ∧ ... ∧ lits[n-1]`,
+ * optionally half-reified by `enforce_lit`.
+ */
+HuubResult huub_model_add_bool_and(HuubModel *handle,
+                                   const int32_t *lits,
+                                   uintptr_t n,
+                                   int32_t enforce_lit);
+
+/**
+ * Post `a → b` (logical implication). Encoded as `proposition(Or(¬a, b))`.
+ */
+HuubResult huub_model_add_implication(HuubModel *handle, int32_t a, int32_t b);
+
+/**
+ * Create a new interval `(start, size, end)` triple. Posts the
+ * consistency constraint `start + size - end == 0` so any constraint
+ * that consumes one component remains in sync with the other two.
+ *
+ * Returns a non-negative interval id on success, or `-1` on error. The
+ * id is independent of int-var ids and only valid as input to interval
+ * constraints (`no_overlap`, `disjunctive`).
+ */
+int32_t huub_model_new_interval(HuubModel *handle, int32_t start, int32_t size, int32_t end);
+
+/**
+ * Post a 1-D no-overlap constraint over the given intervals. Sizes may
+ * be variable (Huub's sweep propagator accepts view-typed sizes).
+ */
+HuubResult huub_model_add_no_overlap(HuubModel *handle, const int32_t *interval_ids, uintptr_t n);
+
+/**
+ * Post a disjunctive constraint over the given intervals. Each
+ * interval's size view **must be a constant** (fixed at posting time);
+ * if a size is not fixed, the call returns `HuubResult::Error` and the
+ * caller should use `huub_model_add_no_overlap` instead. Edge-finding,
+ * not-last, and detectable-precedence propagators are all enabled
+ * (matches `tools/huub_eval/src/translate.rs` line 1063-1067).
+ */
+HuubResult huub_model_add_disjunctive(HuubModel *handle, const int32_t *interval_ids, uintptr_t n);
+
+/**
+ * Post `target = numerator mod denominator`.
+ *
+ * **Synthesized** — Huub has no native `mod`. The decomposition is:
+ * `q := numerator / denominator`, `qd := q * denominator`,
+ * `target == numerator - qd`. The intermediate `q` and `qd` int
+ * decisions are owned by the model but not exposed through the var
+ * registry; callers cannot read their values.
+ *
+ * Upstream-contribution candidate: a native `Model::modulo(...)`
+ * builder would let Huub propagate `mod` tighter than the linear
+ * decomposition does.
+ */
+HuubResult huub_model_add_mod(HuubModel *handle,
+                              int32_t target,
+                              int32_t numerator,
+                              int32_t denominator);
+
+/**
+ * Post the inverse constraint between two equal-length arrays:
+ * `bwd[fwd[i]] == i` and `fwd[bwd[i]] == i` for all `i in [0, n)`.
+ *
+ * **Synthesized** — Huub has no native `inverse`. The decomposition
+ * is `2n` element constraints (one direction each) plus two
+ * `all_different` constraints (each array must be a permutation).
+ *
+ * Upstream-contribution candidate: a native `Model::inverse(...)` would
+ * halve the propagator count and may give tighter bound reasoning.
+ */
+HuubResult huub_model_add_inverse(HuubModel *handle,
+                                  const int32_t *fwd_ids,
+                                  const int32_t *bwd_ids,
+                                  uintptr_t n);
+
+/**
+ * Post `sum(lits) ≤ 1` over the given Boolean literals (treated as 0/1
+ * integers).
+ *
+ * **Synthesized** — Huub has no native `at_most_one`. The
+ * decomposition is one linear constraint over the bool-to-int casts of
+ * the literals.
+ *
+ * Upstream-contribution candidate: a native `Model::at_most_one(...)`
+ * would let pindakaas-cadical use its specialized AMO encoding
+ * (commander / bimander / product) rather than a linear-sum encoding.
+ */
+HuubResult huub_model_add_at_most_one(HuubModel *handle, const int32_t *lits, uintptr_t n);
+
+/**
+ * Lower the model (first call) or re-use the lowered solver
+ * (subsequent calls), then run a single-worker satisfaction search.
+ * Any warm-start hints staged on the handle via
+ * `huub_model_add_hint_{int,bool}` are consumed and installed as a
+ * `WarmStartBrancher` before the search runs; the hint queues are
+ * drained whether or not the solve found a solution.
+ *
+ * `time_limit_seconds <= 0` disables the wall-clock limit. Returns one
+ * of `Satisfied`, `Unsatisfiable`, `Unknown`, or `Error`. After a
+ * successful solve, call `huub_model_value_int` /
+ * `huub_model_value_bool` to read the assignment.
+ *
+ * Re-solve pattern: call `huub_model_reset_for_resolve` between solves
+ * to clear the prior assignment, push new hints, then call
+ * `huub_model_solve` again on the same handle.
  */
 HuubResult huub_model_solve(HuubModel *handle, double time_limit_seconds);
+
+/**
+ * Reset the per-iteration solver state on a Lowered handle, so the
+ * caller can stage new warm-start hints and call `huub_model_solve`
+ * again. The encoded constraints and the lowered solver stay alive;
+ * only the last solve's assignment vectors are cleared.
+ *
+ * Returns `Satisfied` on success, `NotSolved` if the handle hasn't
+ * been solved yet (no-op; same hints stay staged), or `Error` on bad
+ * handle.
+ */
+HuubResult huub_model_reset_for_resolve(HuubModel *handle);
+
+/**
+ * Stage a warm-start hint `int_var[var_id] = value`. The hint is a
+ * preference, not a constraint — if the suggested decision conflicts
+ * with the constraint set, the brancher is consumed and regular search
+ * continues. Hints accumulate across multiple `add_hint` calls and are
+ * applied at the next `huub_model_solve` via a `WarmStartBrancher`.
+ */
+HuubResult huub_model_add_hint_int(HuubModel *handle, int32_t var_id, int64_t value);
+
+/**
+ * Stage a warm-start hint `bool_var[var_id] = value`. Same preference-
+ * not-constraint semantics as `huub_model_add_hint_int`.
+ */
+HuubResult huub_model_add_hint_bool(HuubModel *handle, int32_t var_id, bool value);
+
+/**
+ * Clear all currently-staged warm-start hints (both int and bool). Does
+ * **not** undo warm-start branchers already installed on the solver by
+ * a prior solve — those exhaust themselves as their decisions get
+ * applied or conflict. Suited to the T_squeeze pattern: clear, restage
+ * for the next iteration, solve again.
+ */
+HuubResult huub_model_clear_hints(HuubModel *handle);
+
+/**
+ * Stage an int-variable decision strategy. The brancher is materialized
+ * on the solver at the next `huub_model_solve` call (via
+ * `IntBrancher::new_in`). Branchers stack in registration order.
+ */
+HuubResult huub_model_add_decision_strategy_int(HuubModel *handle,
+                                                const int32_t *var_ids,
+                                                uintptr_t n,
+                                                HuubDecisionSel decision_sel,
+                                                HuubDomainSel domain_sel);
+
+/**
+ * Stage a bool-variable decision strategy. Same lifecycle as
+ * `huub_model_add_decision_strategy_int`.
+ */
+HuubResult huub_model_add_decision_strategy_bool(HuubModel *handle,
+                                                 const int32_t *var_ids,
+                                                 uintptr_t n,
+                                                 HuubDecisionSel decision_sel,
+                                                 HuubDomainSel domain_sel);
+
+/**
+ * Set the top-level search strategy. `switch_after_conflicts` only
+ * matters for `Transition` / `Interleaved`. The strategy is applied to
+ * the solver at the next `huub_model_solve`.
+ */
+HuubResult huub_model_set_search_strategy(HuubModel *handle,
+                                          HuubSearchStrategy strategy,
+                                          uint64_t switch_after_conflicts);
+
+/**
+ * Set a conflict budget. The next `huub_model_solve` (and any
+ * subsequent solve until overwritten) terminates with `Unknown` once
+ * the per-solve learned-clause counter reaches `budget`. A zero
+ * `budget` disables the limit. Combines (OR) with the wall-clock
+ * `time_limit_seconds` passed to `solve`.
+ */
+HuubResult huub_model_set_conflict_budget(HuubModel *handle, uint64_t budget);
+
+/**
+ * Set the optimization objective to `minimize int_var[var_id]`. The
+ * next `huub_model_solve` will dispatch to `Solver::minimize` instead
+ * of `Solver::satisfy`. The objective persists across solves until
+ * overwritten by another `set_minimize` / `set_maximize`.
+ */
+HuubResult huub_model_set_minimize(HuubModel *handle, int32_t var_id);
+
+/**
+ * Set the optimization objective to `maximize int_var[var_id]`.
+ */
+HuubResult huub_model_set_maximize(HuubModel *handle, int32_t var_id);
+
+/**
+ * Read the optimum found by the most-recent `minimize` / `maximize`
+ * solve. Writes to `*out` and returns `Satisfied` on success;
+ * `NotSolved` if the last solve didn't run an optimization or found no
+ * feasible solution.
+ */
+HuubResult huub_model_objective_value(HuubModel *handle, int64_t *out);
 
 /**
  * Read the value of an integer variable from the most recent solve.
