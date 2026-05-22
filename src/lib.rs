@@ -161,7 +161,7 @@ enum HandleState {
 /// what's needed for the next iteration (branchers and search strategy
 /// are typically set once before the first solve; hints change every
 /// T_squeeze iteration).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SolverSetup {
     /// Pending warm-start hints by int-var index in `HuubModel::int_vars`.
     int_hints: Vec<(usize, IntVal)>,
@@ -184,6 +184,17 @@ struct SolverSetup {
     /// an `Arc<AtomicU64>` on each learned clause, read from the
     /// `set_terminate_callback`. Persists across solves.
     conflict_budget: Option<u64>,
+    /// Lower-time CaDiCaL `restart` flag. `None` ⇒ Huub default.
+    /// Applied to the `model.lower()` builder at the Building→Lowered
+    /// transition; ignored once the handle is Lowered.
+    sat_restart: Option<bool>,
+    /// Lower-time CaDiCaL inprocessing master switch. `None` ⇒ Huub
+    /// default. When `Some(b)`, applied to `.inprocessing(b)`,
+    /// `.subsumption(b)`, `.variable_elimination(b)`, `.vivification(b)`,
+    /// `.probing(b)`, and `.preprocessing(b as usize)` on the lower
+    /// builder — mirroring `portfolio.rs:456-461` which toggles the
+    /// CaDiCaL preprocessing stack as a single knob.
+    sat_inprocessing: Option<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,12 +203,14 @@ enum ObjectiveDir {
     Max,
 }
 
+#[derive(Clone)]
 struct PendingIntBrancher {
     var_idxs: Vec<usize>,
     decision_sel: DecisionSelection,
     domain_sel: DomainSelection,
 }
 
+#[derive(Clone)]
 struct PendingBoolBrancher {
     var_idxs: Vec<usize>,
     decision_sel: DecisionSelection,
@@ -234,6 +247,60 @@ pub extern "C" fn huub_model_new() -> *mut HuubModel {
     });
     match r {
         Ok(p) => p,
+        Err(e) => {
+            set_error(panic_msg(&e));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Deep-copy a handle that is still in the Building state. Returns a fresh
+/// handle owning an independent `Model` (cloned), independent variable /
+/// interval registries, an independent copy of the pending solver setup,
+/// and the same `known_unsat` latch.
+///
+/// **Building-state only.** If `handle` has already been solved (its
+/// internal state is `Lowered`), this returns `NULL` and sets a
+/// `huub_last_error` string — cloning a live `Solver` is out of scope for
+/// the C ABI. The expected callsite is C++-side portfolio orchestration:
+/// build the Model once, clone N times, configure each clone with a
+/// different brancher / search strategy / restart / inprocessing setting,
+/// then move each clone into its own worker thread before the first solve.
+///
+/// Returns `NULL` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_clone(handle: *mut HuubModel) -> *mut HuubModel {
+    clear_error();
+    if handle.is_null() {
+        set_error("huub_model_clone: null handle");
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract — handle must originate from huub_model_new.
+        let src = unsafe { &*handle };
+        let model_box = match &src.inner {
+            HandleState::Building(m) => (**m).clone(),
+            HandleState::Lowered { .. } => {
+                return Err(
+                    "huub_model_clone: handle is Lowered; clone before the first solve",
+                );
+            }
+        };
+        Ok(Box::into_raw(Box::new(HuubModel {
+            inner: HandleState::Building(Box::new(model_box)),
+            int_vars: src.int_vars.clone(),
+            bool_vars: src.bool_vars.clone(),
+            intervals: src.intervals.clone(),
+            setup: src.setup.clone(),
+            known_unsat: src.known_unsat,
+        })))
+    }));
+    match r {
+        Ok(Ok(p)) => p,
+        Ok(Err(msg)) => {
+            set_error(msg);
+            ptr::null_mut()
+        }
         Err(e) => {
             set_error(panic_msg(&e));
             ptr::null_mut()
@@ -765,6 +832,157 @@ pub unsafe extern "C" fn huub_model_add_linear_reif(
     res.unwrap_or(HuubResult::Error)
 }
 
+/// Sentinel value for "no enforce literal" in the mixed reified API. We
+/// can't use `< 0` here because negative bool ids encode literal negation
+/// (e.g. `-1` ⇒ `!bool_vars[0]`).
+pub const HUUB_NO_ENFORCE_LIT: i32 = i32::MIN;
+
+/// Resolve a signed bool id into a `View<bool>`. Positive ids look up
+/// directly in `bool_vars`; negative ids decode as `!bool_vars[!id]`
+/// (one's complement). Used only by the `*_mixed_*` entry points — old
+/// positive-only APIs continue using `resolve_one_bool` / `resolve_bool_views`.
+fn resolve_one_bool_signed(
+    h: &HuubModel,
+    id: i32,
+    ctx: &'static str,
+) -> Result<View<bool>, String> {
+    if id >= 0 {
+        let idx = usize::try_from(id).map_err(|_| format!("{ctx}: bad bool id {id}"))?;
+        let v = h
+            .bool_vars
+            .get(idx)
+            .ok_or_else(|| format!("{ctx}: bool id {id} out of range"))?;
+        Ok(*v)
+    } else {
+        let pos = !id;
+        let idx = usize::try_from(pos)
+            .map_err(|_| format!("{ctx}: bad negated bool id {id}"))?;
+        let v = h
+            .bool_vars
+            .get(idx)
+            .ok_or_else(|| format!("{ctx}: negated bool id {id} (pos={pos}) out of range"))?;
+        Ok(!*v)
+    }
+}
+
+/// Post a linear constraint over a mix of integer and Boolean terms,
+/// optionally half-/full-reified.
+///
+/// `int_var_ids` (length `n_ints`) reference Huub int vars; `bool_ids`
+/// (length `n_bools`) reference Huub bools, **signed**: a negative id
+/// `b` means `!bool_vars[!b]` (one's-complement encoding).
+///
+/// The constraint posted is:
+///   `sum(int_coeffs[i] * int_var[i]) + sum(bool_coeffs[j] * bool_view[j]) op rhs`
+/// where each `bool_view[j]` is cast to a 0/1 int via `View::from(...)`.
+///
+/// Reification:
+/// * `enforce_lit == HUUB_NO_ENFORCE_LIT (i32::MIN)` ⇒ unenforced.
+/// * Otherwise `enforce_lit` is a signed bool id (negation supported).
+///   `half = true` ⇒ `enforce → constraint` (implied_by);
+///   `half = false` ⇒ `enforce ↔ constraint` (reified_by).
+///
+/// Either `n_ints` or `n_bools` may be 0 (with the matching pointer NULL
+/// allowed in that case). Returns `Satisfied`, `Unsatisfiable`, or `Error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_add_linear_mixed_reif(
+    handle: *mut HuubModel,
+    int_var_ids: *const i32,
+    int_coeffs: *const i64,
+    n_ints: usize,
+    bool_ids: *const i32,
+    bool_coeffs: *const i64,
+    n_bools: usize,
+    op: HuubRelOp,
+    rhs: i64,
+    enforce_lit: i32,
+    half: bool,
+) -> HuubResult {
+    clear_error();
+    let res = with_handle(handle, |h| {
+        if n_ints > 0 && (int_var_ids.is_null() || int_coeffs.is_null()) {
+            return Err("huub_model_add_linear_mixed_reif: null int arrays with n_ints>0"
+                .to_string());
+        }
+        if n_bools > 0 && (bool_ids.is_null() || bool_coeffs.is_null()) {
+            return Err("huub_model_add_linear_mixed_reif: null bool arrays with n_bools>0"
+                .to_string());
+        }
+        // Resolve int views.
+        let int_views = if n_ints == 0 {
+            Vec::new()
+        } else {
+            resolve_int_views(h, int_var_ids, n_ints, "huub_model_add_linear_mixed_reif")?
+        };
+        // SAFETY: caller contract — int_coeffs valid for n_ints i64.
+        let int_cs: Vec<i64> = if n_ints == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(int_coeffs, n_ints) }.to_vec()
+        };
+        // Resolve bool views (signed) and corresponding coeffs.
+        let mut bool_views: Vec<View<bool>> = Vec::with_capacity(n_bools);
+        if n_bools > 0 {
+            // SAFETY: caller contract — bool_ids valid for n_bools i32.
+            let ids = unsafe { std::slice::from_raw_parts(bool_ids, n_bools) };
+            for &id in ids {
+                bool_views.push(resolve_one_bool_signed(
+                    h,
+                    id,
+                    "huub_model_add_linear_mixed_reif",
+                )?);
+            }
+        }
+        // SAFETY: caller contract — bool_coeffs valid for n_bools i64.
+        let bool_cs: Vec<i64> = if n_bools == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(bool_coeffs, n_bools) }.to_vec()
+        };
+        // Resolve enforce literal (signed). Sentinel = i32::MIN.
+        let enforce_view = if enforce_lit == HUUB_NO_ENFORCE_LIT {
+            None
+        } else {
+            Some(resolve_one_bool_signed(
+                h,
+                enforce_lit,
+                "huub_model_add_linear_mixed_reif (enforce)",
+            )?)
+        };
+        let m = h.model_mut().map_err(|s| s.to_string())?;
+        let mut expr: IntLinearExp = IntLinearExp::from(0_i64);
+        for (v, c) in int_views.into_iter().zip(int_cs.iter().copied()) {
+            expr += v * c;
+        }
+        for (b, c) in bool_views.into_iter().zip(bool_cs.iter().copied()) {
+            let iv: View<IntVal> = View::from(b);
+            expr += iv * c;
+        }
+        let r = match (op, enforce_view, half) {
+            (HuubRelOp::Le, Some(b), true) => m.linear(expr).le(rhs).implied_by(b).post(),
+            (HuubRelOp::Le, Some(b), false) => m.linear(expr).le(rhs).reified_by(b).post(),
+            (HuubRelOp::Le, None, _) => m.linear(expr).le(rhs).post(),
+            (HuubRelOp::Lt, Some(b), true) => m.linear(expr).lt(rhs).implied_by(b).post(),
+            (HuubRelOp::Lt, Some(b), false) => m.linear(expr).lt(rhs).reified_by(b).post(),
+            (HuubRelOp::Lt, None, _) => m.linear(expr).lt(rhs).post(),
+            (HuubRelOp::Ge, Some(b), true) => m.linear(expr).ge(rhs).implied_by(b).post(),
+            (HuubRelOp::Ge, Some(b), false) => m.linear(expr).ge(rhs).reified_by(b).post(),
+            (HuubRelOp::Ge, None, _) => m.linear(expr).ge(rhs).post(),
+            (HuubRelOp::Gt, Some(b), true) => m.linear(expr).gt(rhs).implied_by(b).post(),
+            (HuubRelOp::Gt, Some(b), false) => m.linear(expr).gt(rhs).reified_by(b).post(),
+            (HuubRelOp::Gt, None, _) => m.linear(expr).gt(rhs).post(),
+            (HuubRelOp::Eq, Some(b), true) => m.linear(expr).eq(rhs).implied_by(b).post(),
+            (HuubRelOp::Eq, Some(b), false) => m.linear(expr).eq(rhs).reified_by(b).post(),
+            (HuubRelOp::Eq, None, _) => m.linear(expr).eq(rhs).post(),
+            (HuubRelOp::Ne, Some(b), true) => m.linear(expr).ne(rhs).implied_by(b).post(),
+            (HuubRelOp::Ne, Some(b), false) => m.linear(expr).ne(rhs).reified_by(b).post(),
+            (HuubRelOp::Ne, None, _) => m.linear(expr).ne(rhs).post(),
+        };
+        Ok(latch_post(h, r))
+    });
+    res.unwrap_or(HuubResult::Error)
+}
+
 /// Post a Boolean disjunction `lits[0] ∨ lits[1] ∨ ... ∨ lits[n-1]`,
 /// optionally half-reified by `enforce_lit` (semantics match
 /// `huub_model_add_linear_reif`: `enforce → disjunction`).
@@ -1227,7 +1445,27 @@ fn do_solve(h: &mut HuubModel, time_limit_seconds: f64) -> HuubResult {
             HandleState::Building(m) => m,
             _ => unreachable!(),
         };
-        let (solver, map): (Solver, _) = match model_box.lower().to_solver() {
+        // sat_restart / sat_inprocessing are lower-time CaDiCaL options
+        // (see `tools/huub_eval/src/portfolio.rs:455-461`). Huub's
+        // `Lowerer` is a `bon`-derived typestate builder — calling a
+        // setter consumes `self` and returns a new state, so conditional
+        // chaining via `let mut lowerer = ...` won't type-check. All
+        // setters default to `false` (`Lowerer::DEFAULT_*`), so we just
+        // always pass the unwrapped value: `None ⇒ false` is the same as
+        // not calling the setter.
+        let restart = h.setup.sat_restart.unwrap_or(false);
+        let inproc = h.setup.sat_inprocessing.unwrap_or(false);
+        let (solver, map): (Solver, _) = match model_box
+            .lower()
+            .restart(restart)
+            .inprocessing(inproc)
+            .subsumption(inproc)
+            .variable_elimination(inproc)
+            .vivification(inproc)
+            .probing(inproc)
+            .preprocessing(if inproc { 1 } else { 0 })
+            .to_solver()
+        {
             Ok(pair) => pair,
             Err(e) => {
                 // Restore Building state so callers can introspect.
@@ -1652,6 +1890,52 @@ pub unsafe extern "C" fn huub_model_set_conflict_budget(
     clear_error();
     let res = with_handle(handle, |h| {
         h.setup.conflict_budget = if budget == 0 { None } else { Some(budget) };
+        Ok(HuubResult::Satisfied)
+    });
+    res.unwrap_or(HuubResult::Error)
+}
+
+// ----- Lower-time CaDiCaL knobs -----------------------------------------
+
+/// Enable or disable CaDiCaL **restarts** for the next lowering of this
+/// handle. The flag is stashed on the handle and consumed at the
+/// Building→Lowered transition (the first `huub_model_solve` after
+/// posting constraints). Calling this on a handle that has already been
+/// Lowered has no effect on the existing solver; the new value applies
+/// only if the caller clones a Building-state ancestor and lowers that.
+///
+/// The default matches Huub's `Lowerer::DEFAULT_RESTART` (`false`).
+/// Mirrors `tools/huub_eval/src/portfolio.rs:455`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_set_sat_restart(
+    handle: *mut HuubModel,
+    enable: bool,
+) -> HuubResult {
+    clear_error();
+    let res = with_handle(handle, |h| {
+        h.setup.sat_restart = Some(enable);
+        Ok(HuubResult::Satisfied)
+    });
+    res.unwrap_or(HuubResult::Error)
+}
+
+/// Enable or disable CaDiCaL **inprocessing** for the next lowering of
+/// this handle. This is a single master switch that toggles six
+/// underlying CaDiCaL options together (mirroring
+/// `tools/huub_eval/src/portfolio.rs:456-461`): `inprocessing`,
+/// `subsumption`, `variable_elimination`, `vivification`, `probing`, and
+/// `preprocessing` rounds (`1` when enabled, `0` when disabled).
+///
+/// As with `huub_model_set_sat_restart`, the flag is consumed at the
+/// Building→Lowered transition. Default is `false` (matches Huub).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_set_sat_inprocessing(
+    handle: *mut HuubModel,
+    enable: bool,
+) -> HuubResult {
+    clear_error();
+    let res = with_handle(handle, |h| {
+        h.setup.sat_inprocessing = Some(enable);
         Ok(HuubResult::Satisfied)
     });
     res.unwrap_or(HuubResult::Error)
@@ -2869,6 +3153,164 @@ mod tests {
             let r = huub_model_solve(ptr::null_mut(), 1.0);
             assert_eq!(r, HuubResult::Error);
             huub_model_free(ptr::null_mut()); // no-op
+        }
+    }
+
+    // ----- B.3 — Model clone + lower-time SAT knobs ---------------------
+
+    /// Clone a Building-state handle, then post a constraint to the
+    /// clone only. The original remains under-constrained — both solve
+    /// SAT, but only the clone's assignment respects the extra
+    /// constraint.
+    #[test]
+    fn clone_independent_post_constraint() {
+        unsafe {
+            let orig = huub_model_new();
+            let x = huub_model_new_int_var(orig, 0, 10);
+            assert_eq!(x, 0);
+
+            let cl = huub_model_clone(orig);
+            assert!(!cl.is_null());
+
+            // Post `x >= 7` on the clone only.
+            let ids = [x];
+            let cs = [1_i64];
+            assert_eq!(
+                huub_model_add_linear(cl, ids.as_ptr(), cs.as_ptr(), 1, HuubRelOp::Ge, 7),
+                HuubResult::Satisfied
+            );
+
+            // Pin the original to x = 0 via a brancher so the assignments
+            // are deterministic and distinguishable.
+            let v = [0_usize as i32];
+            assert_eq!(
+                huub_model_add_decision_strategy_int(
+                    orig,
+                    v.as_ptr(),
+                    1,
+                    HuubDecisionSel::InputOrder,
+                    HuubDomainSel::IndomainMin,
+                ),
+                HuubResult::Satisfied
+            );
+
+            assert_eq!(huub_model_solve(orig, 5.0), HuubResult::Satisfied);
+            assert_eq!(huub_model_solve(cl, 5.0), HuubResult::Satisfied);
+
+            let mut xv_o: i64 = -1;
+            let mut xv_c: i64 = -1;
+            assert_eq!(
+                huub_model_value_int(orig, x, &mut xv_o),
+                HuubResult::Satisfied
+            );
+            assert_eq!(
+                huub_model_value_int(cl, x, &mut xv_c),
+                HuubResult::Satisfied
+            );
+            assert_eq!(xv_o, 0, "original has no >=7 constraint");
+            assert!(xv_c >= 7, "clone enforces x >= 7, got {xv_c}");
+
+            huub_model_free(orig);
+            huub_model_free(cl);
+        }
+    }
+
+    /// known_unsat latched on the original should propagate to the clone:
+    /// solving the clone returns Unsatisfiable without running the SAT
+    /// engine.
+    #[test]
+    fn clone_preserves_known_unsat() {
+        unsafe {
+            let orig = huub_model_new();
+            let x = huub_model_new_int_var(orig, 0, 5);
+            let ids = [x];
+            let cs = [1_i64];
+            // x >= 6 is UNSAT at post-time on [0,5] → latches known_unsat.
+            assert_eq!(
+                huub_model_add_linear(orig, ids.as_ptr(), cs.as_ptr(), 1, HuubRelOp::Ge, 6),
+                HuubResult::Unsatisfiable
+            );
+
+            let cl = huub_model_clone(orig);
+            assert!(!cl.is_null());
+            assert_eq!(huub_model_solve(cl, 5.0), HuubResult::Unsatisfiable);
+
+            huub_model_free(orig);
+            huub_model_free(cl);
+        }
+    }
+
+    /// Cloning after the first solve (Lowered state) is rejected with an
+    /// error string. The C++ caller is expected to clone before any
+    /// thread spawns a solve.
+    #[test]
+    fn clone_in_lowered_state_errors() {
+        unsafe {
+            let orig = huub_model_new();
+            let _x = huub_model_new_int_var(orig, 0, 5);
+            assert_eq!(huub_model_solve(orig, 5.0), HuubResult::Satisfied);
+
+            let cl = huub_model_clone(orig);
+            assert!(cl.is_null());
+            let err = huub_last_error();
+            assert!(!err.is_null());
+            let msg = CStr::from_ptr(err).to_string_lossy();
+            assert!(msg.contains("Lowered"), "unexpected error: {msg}");
+
+            huub_model_free(orig);
+        }
+    }
+
+    /// Smoke test for `huub_model_set_sat_restart`: setting the flag on
+    /// either value still allows the solve to complete on a small
+    /// satisfiable model.
+    #[test]
+    fn set_sat_restart_and_solve() {
+        unsafe {
+            for &enable in &[true, false] {
+                let m = huub_model_new();
+                let x = huub_model_new_int_var(m, 0, 10);
+                let y = huub_model_new_int_var(m, 0, 10);
+                let ids = [x, y];
+                let cs = [1_i64, 1_i64];
+                assert_eq!(
+                    huub_model_add_linear(m, ids.as_ptr(), cs.as_ptr(), 2, HuubRelOp::Eq, 7),
+                    HuubResult::Satisfied
+                );
+                assert_eq!(
+                    huub_model_set_sat_restart(m, enable),
+                    HuubResult::Satisfied
+                );
+                assert_eq!(huub_model_solve(m, 5.0), HuubResult::Satisfied);
+                huub_model_free(m);
+            }
+        }
+    }
+
+    /// Smoke test for `huub_model_set_sat_inprocessing`: same shape as
+    /// the restart test. The flag toggles six CaDiCaL knobs together;
+    /// we don't verify the underlying state, only that the solve path
+    /// still works.
+    #[test]
+    fn set_sat_inprocessing_and_solve() {
+        unsafe {
+            for &enable in &[true, false] {
+                let m = huub_model_new();
+                let x = huub_model_new_int_var(m, 0, 10);
+                let y = huub_model_new_int_var(m, 0, 10);
+                let ids = [x, y];
+                let cs = [1_i64, 1_i64];
+                assert_eq!(
+                    huub_model_add_linear(m, ids.as_ptr(), cs.as_ptr(), 2, HuubRelOp::Eq, 7),
+                    HuubResult::Satisfied
+                );
+                assert_eq!(
+                    huub_model_set_sat_inprocessing(m, enable),
+                    HuubResult::Satisfied
+                );
+                assert_eq!(huub_model_solve(m, 5.0), HuubResult::Satisfied);
+                huub_model_free(m);
+            }
         }
     }
 }

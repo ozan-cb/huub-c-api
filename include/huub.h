@@ -14,6 +14,13 @@
 #include <stdbool.h>
 
 /**
+ * Sentinel value for "no enforce literal" in the mixed reified API. We
+ * can't use `< 0` here because negative bool ids encode literal negation
+ * (e.g. `-1` ⇒ `!bool_vars[0]`).
+ */
+#define HUUB_NO_ENFORCE_LIT INT32_MIN
+
+/**
  * Return code for solver-status queries and for entry points that don't
  * return a handle. Mirrors `huub::solver::Status` plus an explicit error
  * code for FFI failures.
@@ -127,6 +134,24 @@ const char *huub_last_error(void);
  * `huub_last_error()`).
  */
 HuubModel *huub_model_new(void);
+
+/**
+ * Deep-copy a handle that is still in the Building state. Returns a fresh
+ * handle owning an independent `Model` (cloned), independent variable /
+ * interval registries, an independent copy of the pending solver setup,
+ * and the same `known_unsat` latch.
+ *
+ * **Building-state only.** If `handle` has already been solved (its
+ * internal state is `Lowered`), this returns `NULL` and sets a
+ * `huub_last_error` string — cloning a live `Solver` is out of scope for
+ * the C ABI. The expected callsite is C++-side portfolio orchestration:
+ * build the Model once, clone N times, configure each clone with a
+ * different brancher / search strategy / restart / inprocessing setting,
+ * then move each clone into its own worker thread before the first solve.
+ *
+ * Returns `NULL` on error.
+ */
+HuubModel *huub_model_clone(HuubModel *handle);
 
 /**
  * Free a model handle previously returned by `huub_model_new()`. Passing
@@ -256,6 +281,39 @@ HuubResult huub_model_add_linear_reif(HuubModel *handle,
                                       int64_t rhs,
                                       int32_t enforce_lit,
                                       bool half);
+
+/**
+ * Post a linear constraint over a mix of integer and Boolean terms,
+ * optionally half-/full-reified.
+ *
+ * `int_var_ids` (length `n_ints`) reference Huub int vars; `bool_ids`
+ * (length `n_bools`) reference Huub bools, **signed**: a negative id
+ * `b` means `!bool_vars[!b]` (one's-complement encoding).
+ *
+ * The constraint posted is:
+ *   `sum(int_coeffs[i] * int_var[i]) + sum(bool_coeffs[j] * bool_view[j]) op rhs`
+ * where each `bool_view[j]` is cast to a 0/1 int via `View::from(...)`.
+ *
+ * Reification:
+ * * `enforce_lit == HUUB_NO_ENFORCE_LIT (i32::MIN)` ⇒ unenforced.
+ * * Otherwise `enforce_lit` is a signed bool id (negation supported).
+ *   `half = true` ⇒ `enforce → constraint` (implied_by);
+ *   `half = false` ⇒ `enforce ↔ constraint` (reified_by).
+ *
+ * Either `n_ints` or `n_bools` may be 0 (with the matching pointer NULL
+ * allowed in that case). Returns `Satisfied`, `Unsatisfiable`, or `Error`.
+ */
+HuubResult huub_model_add_linear_mixed_reif(HuubModel *handle,
+                                            const int32_t *int_var_ids,
+                                            const int64_t *int_coeffs,
+                                            uintptr_t n_ints,
+                                            const int32_t *bool_ids,
+                                            const int64_t *bool_coeffs,
+                                            uintptr_t n_bools,
+                                            HuubRelOp op,
+                                            int64_t rhs,
+                                            int32_t enforce_lit,
+                                            bool half);
 
 /**
  * Post a Boolean disjunction `lits[0] ∨ lits[1] ∨ ... ∨ lits[n-1]`,
@@ -449,6 +507,32 @@ HuubResult huub_model_set_search_strategy(HuubModel *handle,
  * `time_limit_seconds` passed to `solve`.
  */
 HuubResult huub_model_set_conflict_budget(HuubModel *handle, uint64_t budget);
+
+/**
+ * Enable or disable CaDiCaL **restarts** for the next lowering of this
+ * handle. The flag is stashed on the handle and consumed at the
+ * Building→Lowered transition (the first `huub_model_solve` after
+ * posting constraints). Calling this on a handle that has already been
+ * Lowered has no effect on the existing solver; the new value applies
+ * only if the caller clones a Building-state ancestor and lowers that.
+ *
+ * The default matches Huub's `Lowerer::DEFAULT_RESTART` (`false`).
+ * Mirrors `tools/huub_eval/src/portfolio.rs:455`.
+ */
+HuubResult huub_model_set_sat_restart(HuubModel *handle, bool enable);
+
+/**
+ * Enable or disable CaDiCaL **inprocessing** for the next lowering of
+ * this handle. This is a single master switch that toggles six
+ * underlying CaDiCaL options together (mirroring
+ * `tools/huub_eval/src/portfolio.rs:456-461`): `inprocessing`,
+ * `subsumption`, `variable_elimination`, `vivification`, `probing`, and
+ * `preprocessing` rounds (`1` when enabled, `0` when disabled).
+ *
+ * As with `huub_model_set_sat_restart`, the flag is consumed at the
+ * Building→Lowered transition. Default is `false` (matches Huub).
+ */
+HuubResult huub_model_set_sat_inprocessing(HuubModel *handle, bool enable);
 
 /**
  * Set the optimization objective to `minimize int_var[var_id]`. The
