@@ -154,6 +154,19 @@ HuubModel *huub_model_new(void);
 HuubModel *huub_model_clone(HuubModel *handle);
 
 /**
+ * Diagnostic: dump full per-constraint Debug listing (sorted) to `path`.
+ * Returns 0 on success, -1 on failure.
+ */
+int32_t huub_model_diag_dump_full(const HuubModel *handle, const char *path);
+
+/**
+ * Diagnostic: dump per-constraint kind histogram of the current model
+ * to `path`. Returns 0 on success, -1 on failure (null handle, lowered
+ * state, or I/O error).
+ */
+int32_t huub_model_diag_dump_kinds(const HuubModel *handle, const char *path);
+
+/**
  * Free a model handle previously returned by `huub_model_new()`. Passing
  * `NULL` is a no-op.
  */
@@ -365,6 +378,21 @@ HuubResult huub_model_add_no_overlap(HuubModel *handle, const int32_t *interval_
  * (matches `tools/huub_eval/src/translate.rs` line 1063-1067).
  */
 HuubResult huub_model_add_disjunctive(HuubModel *handle, const int32_t *interval_ids, uintptr_t n);
+
+/**
+ * Post a disjunctive directly over (start_var_ids, constant_durations).
+ * Avoids the per-task end-var + interval-consistency-post that
+ * `huub_model_add_disjunctive` requires when going through intervals.
+ *
+ * `n` items; `start_ids` and `durations` are parallel arrays. Items with
+ * `durations[i] <= 0` are skipped (huub `disjunctive` would reject them).
+ * Edge-finding / not-last / detectable-precedence propagators enabled
+ * to match `huub_model_add_disjunctive`.
+ */
+HuubResult huub_model_add_disjunctive_starts_durs(HuubModel *handle,
+                                                  const int32_t *start_ids,
+                                                  const int64_t *durations,
+                                                  uintptr_t n);
 
 /**
  * Post `target = numerator mod denominator`.

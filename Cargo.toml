@@ -14,8 +14,23 @@ categories = ["api-bindings", "algorithms"]
 name = "huub_c_api"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Enables the `extern "C" fn` C ABI surface (~100 entry points). Default
+# on — this is the whole reason the crate exists. Downstream Rust crates
+# that only need the internal `ModelSnapshot` accessor (notably
+# `huub_portfolio_c_api`, which has its own C ABI) should depend on this
+# crate with `default-features = false` to avoid pulling the C symbols
+# into their own staticlib — otherwise the C++ link line gets multiple
+# definitions of every `huub_model_*` entry.
+default = ["c-abi"]
+c-abi = []
+
 [dependencies]
-huub = { git = "https://github.com/huub-solver/huub" }
+# Use the same Huub source as huub_portfolio_c_api (which pins via
+# third_party/huub). Sharing one Huub source across both C-ABI crates is
+# the prerequisite for passing a Huub Model handle from huub-c-api into
+# huub_portfolio_c_api (cross-crate type identity).
+huub = { path = "../../third_party/huub/crates/huub" }
 
 [build-dependencies]
 cbindgen = "0.29"

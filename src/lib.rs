@@ -90,6 +90,7 @@ fn clear_error() {
 /// Returns the last error message recorded on the calling thread, or
 /// `NULL` if no error has occurred since the last successful call. The
 /// returned pointer is valid until the next FFI call on this thread.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub extern "C" fn huub_last_error() -> *const c_char {
     LAST_ERROR.with(|e| match &*e.borrow() {
@@ -232,6 +233,7 @@ impl HuubModel {
 
 /// Create a new model handle. Returns `NULL` on failure (call
 /// `huub_last_error()`).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub extern "C" fn huub_model_new() -> *mut HuubModel {
     clear_error();
@@ -268,6 +270,7 @@ pub extern "C" fn huub_model_new() -> *mut HuubModel {
 /// then move each clone into its own worker thread before the first solve.
 ///
 /// Returns `NULL` on error.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_clone(handle: *mut HuubModel) -> *mut HuubModel {
     clear_error();
@@ -308,8 +311,104 @@ pub unsafe extern "C" fn huub_model_clone(handle: *mut HuubModel) -> *mut HuubMo
     }
 }
 
+/// Rust-only accessor: deep-copy of the inner [`huub::Model`] along with
+/// the variable registries needed to map C-ABI var ids (i32) back to
+/// [`huub::model::View`]s on the cloned model.
+///
+/// Used by `huub_portfolio_c_api` to hand the Model and its role map to
+/// the portfolio without going back through proto. Both crates depend on
+/// the same vendored `huub` source (see `tools/huub-c-api/Cargo.toml`),
+/// so the [`View`] / [`Model`] types are identical across the boundary.
+///
+/// Returns `None` if `handle` is null or already lowered. The caller-
+/// visible state of `handle` is unchanged — the snapshot is independent.
+///
+/// This is `#[doc(hidden)]` because it leaks `huub` types: only crates
+/// that share the same `huub` source can call it soundly.
+#[doc(hidden)]
+pub struct ModelSnapshot {
+    pub model: Model,
+    pub int_vars: Vec<View<IntVal>>,
+    pub bool_vars: Vec<View<bool>>,
+    pub known_unsat: bool,
+}
+
+#[doc(hidden)]
+pub unsafe fn inner_model_clone(handle: *const HuubModel) -> Option<ModelSnapshot> {
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract — handle must originate from huub_model_new
+    // and still be live on the calling thread.
+    let h = unsafe { &*handle };
+    match &h.inner {
+        HandleState::Building(m) => Some(ModelSnapshot {
+            model: (**m).clone(),
+            int_vars: h.int_vars.clone(),
+            bool_vars: h.bool_vars.clone(),
+            known_unsat: h.known_unsat,
+        }),
+        HandleState::Lowered { .. } => None,
+    }
+}
+
+/// Diagnostic: dump full per-constraint Debug listing (sorted) to `path`.
+/// Returns 0 on success, -1 on failure.
+#[cfg(feature = "c-abi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_diag_dump_full(
+    handle: *const HuubModel,
+    path: *const c_char,
+) -> i32 {
+    clear_error();
+    if handle.is_null() || path.is_null() {
+        return -1;
+    }
+    let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let h = unsafe { &*handle };
+    match &h.inner {
+        HandleState::Building(m) => match m.diag_dump_full(path_str) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
+        HandleState::Lowered { .. } => -1,
+    }
+}
+
+/// Diagnostic: dump per-constraint kind histogram of the current model
+/// to `path`. Returns 0 on success, -1 on failure (null handle, lowered
+/// state, or I/O error).
+#[cfg(feature = "c-abi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_diag_dump_kinds(
+    handle: *const HuubModel,
+    path: *const c_char,
+) -> i32 {
+    clear_error();
+    if handle.is_null() || path.is_null() {
+        return -1;
+    }
+    // SAFETY: caller contract.
+    let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let h = unsafe { &*handle };
+    match &h.inner {
+        HandleState::Building(m) => match m.diag_dump_kinds(path_str) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
+        HandleState::Lowered { .. } => -1,
+    }
+}
+
 /// Free a model handle previously returned by `huub_model_new()`. Passing
 /// `NULL` is a no-op.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_free(handle: *mut HuubModel) {
     if handle.is_null() {
@@ -326,6 +425,7 @@ pub unsafe extern "C" fn huub_model_free(handle: *mut HuubModel) {
 /// Create a new integer decision variable with domain `[lb, ub]`. Returns
 /// a non-negative variable id on success, or `-1` on error (call
 /// `huub_last_error()` for details).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_new_int_var(
     handle: *mut HuubModel,
@@ -348,6 +448,7 @@ pub unsafe extern "C" fn huub_model_new_int_var(
 
 /// Create a new Boolean decision variable. Returns a non-negative variable
 /// id on success, or `-1` on error.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_new_bool_var(handle: *mut HuubModel) -> i32 {
     clear_error();
@@ -369,6 +470,7 @@ pub unsafe extern "C" fn huub_model_new_bool_var(handle: *mut HuubModel) -> i32 
 /// pass a constant duration into `huub_model_new_interval`. Internally
 /// posts a singleton-domain decision `val..=val`; the solver folds it to
 /// a constant `View<IntVal>` during lowering.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_new_constant(handle: *mut HuubModel, val: i64) -> i32 {
     clear_error();
@@ -545,6 +647,7 @@ pub enum HuubSearchStrategy {
 /// without immediate conflict), `HuubResult::Unsatisfiable` if posting
 /// the constraint immediately proved the model infeasible, or
 /// `HuubResult::Error` on FFI failure.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_linear(
     handle: *mut HuubModel,
@@ -606,6 +709,7 @@ pub unsafe extern "C" fn huub_model_add_linear(
 
 /// Post `target = max(vars[0], ..., vars[n-1])`. All ids must be valid
 /// int-var ids. `n` must be > 0.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_max(
     handle: *mut HuubModel,
@@ -628,6 +732,7 @@ pub unsafe extern "C" fn huub_model_add_max(
 }
 
 /// Post `target = min(vars[0], ..., vars[n-1])`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_min(
     handle: *mut HuubModel,
@@ -650,6 +755,7 @@ pub unsafe extern "C" fn huub_model_add_min(
 }
 
 /// Post `target = a * b`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_mul(
     handle: *mut HuubModel,
@@ -673,6 +779,7 @@ pub unsafe extern "C" fn huub_model_add_mul(
 /// `IntDivBounds` defines the rounding convention; callers should
 /// constrain the denominator's domain to avoid zero if division-by-zero
 /// is not desired.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_div(
     handle: *mut HuubModel,
@@ -697,6 +804,7 @@ pub unsafe extern "C" fn huub_model_add_div(
 /// Post `target = values[index]`, where `values` is a constant array
 /// (length `n`) of i64 and `index` is an int-var id whose domain must
 /// cover at least `[0, n-1]` to make the constraint satisfiable.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_element_const(
     handle: *mut HuubModel,
@@ -726,6 +834,7 @@ pub unsafe extern "C" fn huub_model_add_element_const(
 
 /// Post `target = array[index]`, where `array` is an array (length `n`)
 /// of int-var ids and `index` is an int-var id.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_element_var(
     handle: *mut HuubModel,
@@ -751,6 +860,7 @@ pub unsafe extern "C" fn huub_model_add_element_var(
 
 /// Post `all_different(vars)`: each pair of variables in the list must
 /// take distinct values.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_all_different(
     handle: *mut HuubModel,
@@ -778,6 +888,7 @@ pub unsafe extern "C" fn huub_model_add_all_different(
 ///
 /// If `enforce_lit < 0` the call is equivalent to a plain
 /// `huub_model_add_linear`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_linear_reif(
     handle: *mut HuubModel,
@@ -884,6 +995,7 @@ fn resolve_one_bool_signed(
 ///
 /// Either `n_ints` or `n_bools` may be 0 (with the matching pointer NULL
 /// allowed in that case). Returns `Satisfied`, `Unsatisfiable`, or `Error`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_linear_mixed_reif(
     handle: *mut HuubModel,
@@ -986,6 +1098,7 @@ pub unsafe extern "C" fn huub_model_add_linear_mixed_reif(
 /// Post a Boolean disjunction `lits[0] ∨ lits[1] ∨ ... ∨ lits[n-1]`,
 /// optionally half-reified by `enforce_lit` (semantics match
 /// `huub_model_add_linear_reif`: `enforce → disjunction`).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_bool_or(
     handle: *mut HuubModel,
@@ -1019,6 +1132,7 @@ pub unsafe extern "C" fn huub_model_add_bool_or(
 
 /// Post a Boolean conjunction `lits[0] ∧ lits[1] ∧ ... ∧ lits[n-1]`,
 /// optionally half-reified by `enforce_lit`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_bool_and(
     handle: *mut HuubModel,
@@ -1049,6 +1163,7 @@ pub unsafe extern "C" fn huub_model_add_bool_and(
 }
 
 /// Post `a → b` (logical implication). Encoded as `proposition(Or(¬a, b))`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_implication(
     handle: *mut HuubModel,
@@ -1076,6 +1191,7 @@ pub unsafe extern "C" fn huub_model_add_implication(
 /// Returns a non-negative interval id on success, or `-1` on error. The
 /// id is independent of int-var ids and only valid as input to interval
 /// constraints (`no_overlap`, `disjunctive`).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_new_interval(
     handle: *mut HuubModel,
@@ -1135,6 +1251,7 @@ fn resolve_intervals(
 
 /// Post a 1-D no-overlap constraint over the given intervals. Sizes may
 /// be variable (Huub's sweep propagator accepts view-typed sizes).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_no_overlap(
     handle: *mut HuubModel,
@@ -1165,6 +1282,7 @@ pub unsafe extern "C" fn huub_model_add_no_overlap(
 /// caller should use `huub_model_add_no_overlap` instead. Edge-finding,
 /// not-last, and detectable-precedence propagators are all enabled
 /// (matches `tools/huub_eval/src/translate.rs` line 1063-1067).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_disjunctive(
     handle: *mut HuubModel,
@@ -1212,6 +1330,71 @@ pub unsafe extern "C" fn huub_model_add_disjunctive(
     res.unwrap_or(HuubResult::Error)
 }
 
+/// Post a disjunctive directly over (start_var_ids, constant_durations).
+/// Avoids the per-task end-var + interval-consistency-post that
+/// `huub_model_add_disjunctive` requires when going through intervals.
+///
+/// `n` items; `start_ids` and `durations` are parallel arrays. Items with
+/// `durations[i] <= 0` are skipped (huub `disjunctive` would reject them).
+/// Edge-finding / not-last / detectable-precedence propagators enabled
+/// to match `huub_model_add_disjunctive`.
+#[cfg(feature = "c-abi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn huub_model_add_disjunctive_starts_durs(
+    handle: *mut HuubModel,
+    start_ids: *const i32,
+    durations: *const i64,
+    n: usize,
+) -> HuubResult {
+    clear_error();
+    let res = with_handle(handle, |h| {
+        if n > 0 && (start_ids.is_null() || durations.is_null()) {
+            return Err(
+                "huub_model_add_disjunctive_starts_durs: null array with n>0"
+                    .to_string(),
+            );
+        }
+        // SAFETY: caller contract — pointers valid for n elements.
+        let ids = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(start_ids, n) }
+        };
+        let durs_in = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(durations, n) }
+        };
+        let mut starts: Vec<View<IntVal>> = Vec::with_capacity(n);
+        let mut durs: Vec<IntVal> = Vec::with_capacity(n);
+        for (i, &id) in ids.iter().enumerate() {
+            let d = durs_in[i];
+            if d <= 0 {
+                continue;
+            }
+            let v = resolve_one_int(
+                h, id, "huub_model_add_disjunctive_starts_durs",
+            )?;
+            starts.push(v);
+            durs.push(d);
+        }
+        if starts.len() <= 1 {
+            return Ok(HuubResult::Satisfied);
+        }
+        let m = h.model_mut().map_err(|s| s.to_string())?;
+        let r = m
+            .disjunctive()
+            .start_times(starts)
+            .durations(durs)
+            .edge_finding_propagation(true)
+            .not_last_propagation(true)
+            .detectable_precedence_propagation(true)
+            .post();
+        Ok(latch_post(h, r))
+    });
+    res.unwrap_or(HuubResult::Error)
+}
+
 // ----- Synthesized primitives -------------------------------------------
 //
 // These three entries cover constraint classes that the C++ `IScheduleSolver`
@@ -1232,6 +1415,7 @@ pub unsafe extern "C" fn huub_model_add_disjunctive(
 /// Upstream-contribution candidate: a native `Model::modulo(...)`
 /// builder would let Huub propagate `mod` tighter than the linear
 /// decomposition does.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_mod(
     handle: *mut HuubModel,
@@ -1297,6 +1481,7 @@ pub unsafe extern "C" fn huub_model_add_mod(
 ///
 /// Upstream-contribution candidate: a native `Model::inverse(...)` would
 /// halve the propagator count and may give tighter bound reasoning.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_inverse(
     handle: *mut HuubModel,
@@ -1359,6 +1544,7 @@ pub unsafe extern "C" fn huub_model_add_inverse(
 /// Upstream-contribution candidate: a native `Model::at_most_one(...)`
 /// would let pindakaas-cadical use its specialized AMO encoding
 /// (commander / bimander / product) rather than a linear-sum encoding.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_at_most_one(
     handle: *mut HuubModel,
@@ -1401,6 +1587,7 @@ pub unsafe extern "C" fn huub_model_add_at_most_one(
 /// Re-solve pattern: call `huub_model_reset_for_resolve` between solves
 /// to clear the prior assignment, push new hints, then call
 /// `huub_model_solve` again on the same handle.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_solve(
     handle: *mut HuubModel,
@@ -1672,6 +1859,7 @@ fn do_solve(h: &mut HuubModel, time_limit_seconds: f64) -> HuubResult {
 /// Returns `Satisfied` on success, `NotSolved` if the handle hasn't
 /// been solved yet (no-op; same hints stay staged), or `Error` on bad
 /// handle.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_reset_for_resolve(handle: *mut HuubModel) -> HuubResult {
     clear_error();
@@ -1705,6 +1893,7 @@ pub unsafe extern "C" fn huub_model_reset_for_resolve(handle: *mut HuubModel) ->
 /// with the constraint set, the brancher is consumed and regular search
 /// continues. Hints accumulate across multiple `add_hint` calls and are
 /// applied at the next `huub_model_solve` via a `WarmStartBrancher`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_hint_int(
     handle: *mut HuubModel,
@@ -1728,6 +1917,7 @@ pub unsafe extern "C" fn huub_model_add_hint_int(
 
 /// Stage a warm-start hint `bool_var[var_id] = value`. Same preference-
 /// not-constraint semantics as `huub_model_add_hint_int`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_hint_bool(
     handle: *mut HuubModel,
@@ -1754,6 +1944,7 @@ pub unsafe extern "C" fn huub_model_add_hint_bool(
 /// a prior solve — those exhaust themselves as their decisions get
 /// applied or conflict. Suited to the T_squeeze pattern: clear, restage
 /// for the next iteration, solve again.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_clear_hints(handle: *mut HuubModel) -> HuubResult {
     clear_error();
@@ -1770,6 +1961,7 @@ pub unsafe extern "C" fn huub_model_clear_hints(handle: *mut HuubModel) -> HuubR
 /// Stage an int-variable decision strategy. The brancher is materialized
 /// on the solver at the next `huub_model_solve` call (via
 /// `IntBrancher::new_in`). Branchers stack in registration order.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_decision_strategy_int(
     handle: *mut HuubModel,
@@ -1810,6 +2002,7 @@ pub unsafe extern "C" fn huub_model_add_decision_strategy_int(
 
 /// Stage a bool-variable decision strategy. Same lifecycle as
 /// `huub_model_add_decision_strategy_int`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_add_decision_strategy_bool(
     handle: *mut HuubModel,
@@ -1851,6 +2044,7 @@ pub unsafe extern "C" fn huub_model_add_decision_strategy_bool(
 /// Set the top-level search strategy. `switch_after_conflicts` only
 /// matters for `Transition` / `Interleaved`. The strategy is applied to
 /// the solver at the next `huub_model_solve`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_search_strategy(
     handle: *mut HuubModel,
@@ -1882,6 +2076,7 @@ pub unsafe extern "C" fn huub_model_set_search_strategy(
 /// the per-solve learned-clause counter reaches `budget`. A zero
 /// `budget` disables the limit. Combines (OR) with the wall-clock
 /// `time_limit_seconds` passed to `solve`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_conflict_budget(
     handle: *mut HuubModel,
@@ -1906,6 +2101,7 @@ pub unsafe extern "C" fn huub_model_set_conflict_budget(
 ///
 /// The default matches Huub's `Lowerer::DEFAULT_RESTART` (`false`).
 /// Mirrors `tools/huub_eval/src/portfolio.rs:455`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_sat_restart(
     handle: *mut HuubModel,
@@ -1928,6 +2124,7 @@ pub unsafe extern "C" fn huub_model_set_sat_restart(
 ///
 /// As with `huub_model_set_sat_restart`, the flag is consumed at the
 /// Building→Lowered transition. Default is `false` (matches Huub).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_sat_inprocessing(
     handle: *mut HuubModel,
@@ -1947,6 +2144,7 @@ pub unsafe extern "C" fn huub_model_set_sat_inprocessing(
 /// next `huub_model_solve` will dispatch to `Solver::minimize` instead
 /// of `Solver::satisfy`. The objective persists across solves until
 /// overwritten by another `set_minimize` / `set_maximize`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_minimize(
     handle: *mut HuubModel,
@@ -1968,6 +2166,7 @@ pub unsafe extern "C" fn huub_model_set_minimize(
 }
 
 /// Set the optimization objective to `maximize int_var[var_id]`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_set_maximize(
     handle: *mut HuubModel,
@@ -1992,6 +2191,7 @@ pub unsafe extern "C" fn huub_model_set_maximize(
 /// solve. Writes to `*out` and returns `Satisfied` on success;
 /// `NotSolved` if the last solve didn't run an optimization or found no
 /// feasible solution.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_objective_value(
     handle: *mut HuubModel,
@@ -2021,6 +2221,7 @@ pub unsafe extern "C" fn huub_model_objective_value(
 /// Read the value of an integer variable from the most recent solve.
 /// Writes to `*out` and returns `Satisfied` on success; returns
 /// `NotSolved` / `Error` on failure (leaving `*out` untouched).
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_value_int(
     handle: *mut HuubModel,
@@ -2055,6 +2256,7 @@ pub unsafe extern "C" fn huub_model_value_int(
 
 /// Read the value of a Boolean variable from the most recent solve.
 /// Same contract as `huub_model_value_int`.
+#[cfg(feature = "c-abi")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn huub_model_value_bool(
     handle: *mut HuubModel,
@@ -3258,6 +3460,32 @@ mod tests {
             assert!(msg.contains("Lowered"), "unexpected error: {msg}");
 
             huub_model_free(orig);
+        }
+    }
+
+    /// `inner_model_clone` returns Some for Building state and None for
+    /// Lowered. The snapshot's `int_vars` length tracks the source's
+    /// var registry length.
+    #[test]
+    fn inner_model_clone_building_then_lowered() {
+        unsafe {
+            let m = huub_model_new();
+            let _x = huub_model_new_int_var(m, 0, 5);
+            let _y = huub_model_new_int_var(m, 0, 5);
+            let _b = huub_model_new_bool_var(m);
+
+            let snap = inner_model_clone(m);
+            assert!(snap.is_some(), "Building-state clone should succeed");
+            let s = snap.unwrap();
+            assert_eq!(s.int_vars.len(), 2);
+            assert_eq!(s.bool_vars.len(), 1);
+            assert!(!s.known_unsat);
+
+            // Lower the original by solving; subsequent calls must return None.
+            assert_eq!(huub_model_solve(m, 5.0), HuubResult::Satisfied);
+            assert!(inner_model_clone(m).is_none());
+
+            huub_model_free(m);
         }
     }
 
